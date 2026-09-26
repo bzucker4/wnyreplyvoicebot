@@ -11,6 +11,7 @@ from snow_plow_dispatch_bot.agent import DispatchAgent
 from snow_plow_dispatch_bot.app import create_app
 from snow_plow_dispatch_bot.config import Settings
 from snow_plow_dispatch_bot.db import Database
+from snow_plow_dispatch_bot.sms import Notifier
 
 _ids = itertools.count(1)
 
@@ -68,9 +69,16 @@ class RecordingSms:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
 
+    def to(self, number: str) -> list[str]:
+        return [body for to, body in self.sent if to == number]
+
     def send(self, to: str, body: str) -> bool:
         self.sent.append((to, body))
         return True
+
+
+OWNER = "+17165550199"
+ON_CALL = "+17165550188"
 
 
 @pytest.fixture
@@ -79,8 +87,10 @@ def settings() -> Settings:
         database_path=":memory:",
         validate_twilio_signature=False,
         dispatch_api_token="secret",
-        dispatcher_phone="+17165550199",
+        owner_phone=OWNER,
+        on_call_phone=ON_CALL,
         twilio_from_number="+17165550100",
+        callback_timeframe="30 minutes",
     )
 
 
@@ -97,6 +107,11 @@ def fake_client() -> FakeClient:
 @pytest.fixture
 def sms() -> RecordingSms:
     return RecordingSms()
+
+
+@pytest.fixture
+def notifier(settings, sms) -> Notifier:
+    return Notifier(settings, sms)
 
 
 @pytest.fixture

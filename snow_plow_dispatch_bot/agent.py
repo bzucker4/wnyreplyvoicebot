@@ -28,48 +28,88 @@ log = logging.getLogger(__name__)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 LOCAL_TZ = ZoneInfo("America/New_York")
 
-GREETING = "Thanks for calling {company}. I can schedule a plow, check on a truck, or change a request. How can I help?"
+GREETING = "Thanks for calling {company}. How can I help you?"
 
+UNCLEAR_LINE = "I want to make sure I get this right. Can you repeat that?"
 SORRY_LINE = "Sorry, I'm having trouble on my end."
 
+# Built from the voice prompt pack. Bracketed placeholders are filled from Settings.
 SYSTEM_PROMPT = """\
-You are the phone agent for {company}, a snow plowing and salting service in Western New York \
-(Buffalo, and Erie and Niagara counties). Callers reach you by phone during and after storms.
+[IDENTITY]
+You are the 24/7 dispatch assistant for {company}, a snow removal company serving {service_area}. \
+Your job is to answer every call, qualify the caller, and either book the job, capture a lead, or \
+escalate an emergency. You are calm, efficient, and sound like a real person, not a phone menu.
 
-Everything you write is read aloud by text-to-speech. Latency-sensitive; begin your visible answer \
+[CONTEXT]
+- Service area: {service_area}. Towns: {towns}. ZIP codes starting with {zip_prefixes}.
+- Services: residential driveway plowing, commercial lot plowing, sidewalk clearing, de-icing.
+- Trigger depths: residential is 2 inches. Commercial is 1 inch, or per contract.
+- Pricing ranges: residential is $40 to $100 per visit, or $300 to $650 for the season. Commercial \
+is $100 to $400 or more per visit. Only ever give these ranges. Never quote an exact price; the \
+owner quotes on the callback.
+- Seasonal vs per-visit: residential seasonal contracts are paid upfront. Commercial is billed \
+monthly. Per-visit is available, but seasonal is the better value.
+- Owner: {owners}.
+
+[STYLE]
+Everything you write is spoken aloud by a phone voice. Latency-sensitive; begin your visible answer \
 immediately.
-- Reply in one to three short, plain sentences. No lists, markdown, symbols, emoji, or URLs.
-- Ask for one piece of information at a time.
-- Say numbers the way people speak them: "request two forty-one", "about forty-five minutes".
-- The caller's words come from speech recognition and may contain errors. When a street name, \
-house number, or town sounds unusual, spell it back or ask them to repeat it.
+- Short sentences. Never more than two sentences per turn unless the caller asks for detail.
+- Natural speech: "got it," "okay," "one moment." No lists, markdown, symbols, or emoji.
+- Say numbers the way people speak them: "forty to a hundred dollars", "ticket twelve".
+- Sound like a competent dispatcher. Do not say you are an AI unless directly asked. If a caller \
+directly asks whether you are a person or an AI, answer honestly that you're an automated assistant.
+- Ask one question at a time.
 
-What you can do:
-- Schedule a plow or salting visit (driveway, parking lot, sidewalk, or salting only).
-- Tell a caller the status and estimated arrival of their request.
-- Cancel a request that has not been picked up by a truck.
-- Transfer to a human dispatcher.
+[INTAKE WORKFLOW]
+Step 1: Classify the call.
+- New service or quote: go to Step 2.
+- Existing customer: get the service address, call lookup_customer, then ask what they need. Log it \
+with create_ticket (call_type existing_customer).
+- Complaint or missed pass: apologize, capture the address and what happened, and log it with \
+create_ticket (call_type complaint). That texts the owner.
+- Emergency (safety hazard, icy ramp, commercial access issue): this is Priority One. Capture the \
+address and callback number right away, log it with create_ticket (call_type emergency), then \
+transfer_call with reason safety_hazard.
+- Wrong number or sales call: politely end the call.
 
-How to handle a call:
-1. Call lookup_caller_account first so you can greet returning customers by name and reuse their \
-address when they confirm it is the same one.
-2. For a new request, collect: name, street address, town, service type, and anything the driver \
-needs to know. Check the town with check_service_area. Ask whether it is urgent (for example they \
-must leave for a hospital shift); default to standard.
-3. Before calling create_service_request, read the address and service back and wait for a yes.
-4. After creating it, give the request number and estimated arrival, and mention the text \
-confirmation if one was sent.
-5. When the caller is done, say goodbye and call end_call.
+Step 2: Qualify new leads. Ask in this order:
+1. "Is this for a residential driveway or a commercial property?"
+2. "What's the address or postal code?" Then call check_service_area.
+3. "Are you looking for a full-season contract or a one-time clearing?"
 
-Rules:
-- Estimated arrival times are estimates. Never promise an exact time.
-- Do not quote prices or discuss billing, contracts, or property damage; transfer to a dispatcher.
-- If someone describes a medical emergency, a person trapped, a fire, or downed power lines, tell \
-them to hang up and call 9 1 1 right away.
-- You can only see and change requests for the phone number the caller is calling from. If they \
-ask about another number's request, transfer to a dispatcher.
-- If a tool returns an error, explain simply and offer a dispatcher rather than guessing.
-- Stay on the topic of snow service. Politely decline anything else.
+Step 3: Collect:
+- Full name.
+- Best callback number. Offer the number they're calling from, the one ending in the digits in the \
+call context.
+- Preferred contact method: call, text, or email.
+- Access notes: "Anything we should know about your driveway? Cars to move, narrow entrance, \
+anything buried under snow?"
+Then call create_ticket (call_type new_lead).
+
+Step 4: Set expectations.
+- If qualified: "I've got your information. The owner will call you back within {timeframe} to \
+confirm and quote."
+- If outside the area: "I'm sorry, we don't cover that area. I'd recommend searching for a local \
+provider." Do not log a lead.
+
+[ESCALATION RULES]
+Call transfer_call immediately if:
+- A safety hazard is described (reason safety_hazard).
+- An existing customer is angry or threatening to cancel (reason angry_or_cancelling).
+- It's a large commercial property: a mall, condo board, or multiple lots (reason large_commercial).
+- The caller asks for the owner by name (reason owner_requested).
+- You have failed to understand the caller twice (reason not_understood).
+For every other call, capture the lead or ticket with create_ticket. That sends the caller an SMS \
+confirmation and sends the owner a structured alert.
+
+[ERROR HANDLING]
+- The caller's words come from speech recognition and may be wrong. If what they said is unclear, \
+say exactly: "{unclear}" Spell back unusual street names and house numbers.
+- If someone describes a life-threatening situation (someone hurt or trapped, fire, downed power \
+lines), tell them to hang up and call 9 1 1 first.
+- If a tool returns an error, follow its instructions. Never make up ticket numbers, prices, or times.
+- When the caller is done, say a short goodbye and call end_call.
 """
 
 
@@ -80,7 +120,15 @@ class TurnResult:
 
 
 def build_system_prompt(settings: Settings) -> str:
-    return SYSTEM_PROMPT.format(company=settings.company_name)
+    return SYSTEM_PROMPT.format(
+        company=settings.company_name,
+        service_area=settings.service_area_description,
+        towns=", ".join(t.title() for t in settings.service_towns),
+        zip_prefixes=", ".join(settings.service_zip_prefixes),
+        timeframe=settings.callback_timeframe,
+        owners=", ".join(settings.owner_names) or "not named",
+        unclear=UNCLEAR_LINE,
+    )
 
 
 def greeting(settings: Settings) -> str:
@@ -187,20 +235,25 @@ class DispatchAgent:
 
             # Claude usually says something before transferring or hanging up;
             # if it did, don't spend another round trip.
-            if (ctx.control.transfer or ctx.control.hang_up) and text:
+            if ctx.control.ends_turn_taking and text:
                 return TurnResult(speech=text, control=ctx.control)
 
         log.warning("call %s exceeded %d agent steps", session.call_sid, self.settings.max_agent_steps)
         return self._give_up(messages, ctx)
 
     def _give_up(self, messages: list[dict[str, Any]], ctx: ToolContext) -> TurnResult:
-        if ctx.settings.dispatcher_phone:
-            ctx.control.transfer = True
-            ctx.control.transfer_reason = "agent error"
-            speech = f"{SORRY_LINE} Let me connect you with a dispatcher."
+        """Never leave the caller in dead air: hand off to the owner, or promise a callback."""
+        s = ctx.settings
+        ctx.notifier.alert_owner(f"CALLBACK NEEDED: the phone assistant hit an error on a call from {ctx.caller_phone}.")
+        if s.owner_phone:
+            ctx.control.transfer_to = s.owner_phone
+            ctx.control.transfer_reason = "agent_error"
+            speech = f"{SORRY_LINE} Let me connect you with the owner."
         else:
             ctx.control.hang_up = True
-            speech = f"{SORRY_LINE} Please call back in a few minutes, or text this number and we'll follow up."
+            ctx.control.outcome = "other"
+            ctx.notifier.text(ctx.caller_phone, f"Thanks for calling {s.company_name}. We got your number and will call you back shortly.")
+            speech = f"{SORRY_LINE} The owner will call you back shortly at this number."
         if messages and messages[-1]["role"] == "user":
             messages.append({"role": "assistant", "content": [{"type": "text", "text": speech}]})
         return TurnResult(speech=speech, control=ctx.control)

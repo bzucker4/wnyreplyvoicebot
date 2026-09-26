@@ -2,112 +2,136 @@
 
 **Mode:** Greenfield
 **Repository:** `wnyreplyvoicebot`
-**Status:** v0.1, first working version
+**Status:** v0.2, built from the voice prompt pack
 
 ## Purpose
 
-A phone agent for a snow plowing and salting service in Western New York (Buffalo, Erie and
-Niagara counties). During a storm the phones flood with the same few requests: "plow my
-driveway", "where's my truck", "cancel, my neighbor did it". The bot answers every call right
-away, handles those requests on its own, and hands anything else to a human dispatcher.
+A 24/7 phone dispatch assistant for a snow removal company. It answers every call and
+qualifies the caller. Then it does one of three things: captures a lead for the owner to
+quote, logs a request or complaint from an existing customer, or escalates an emergency to a
+person. It should sound like a competent dispatcher, not a phone menu.
 
-## Users
+The conversation behavior comes from the voice prompt pack. Its text lives in `SYSTEM_PROMPT`
+in `snow_plow_dispatch_bot/agent.py`. The pack's placeholders are filled from settings:
 
-| Who | How they interact |
+| Placeholder | Setting | Default |
+|---|---|---|
+| `[COMPANY NAME]` | `COMPANY_NAME` | WNY Snow Plow Dispatch |
+| `[SERVICE AREA]` | `SERVICE_AREA` | Buffalo and the Erie and Niagara county suburbs |
+| `[ZIP CODES / TOWNS]` | `SERVICE_TOWNS`, `SERVICE_ZIP_PREFIXES` | Erie/Niagara towns; `140`, `141`, `142` |
+| `[TIMEFRAME]` | `CALLBACK_TIMEFRAME` | 30 minutes |
+| Owner name(s) callers may ask for | `OWNER_NAMES` | none |
+
+## Business context (from the prompt pack)
+
+- **Services:** residential driveway plowing, commercial lot plowing, sidewalk clearing, de-icing.
+- **Trigger depths:** 2 inches for residential. For commercial, 1 inch or whatever the contract says.
+- **Pricing:** the bot gives ranges only and never an exact price. Residential is $40–$100
+  per visit or $300–$650 for the season. Commercial is $100–$400+ per visit.
+- **Billing:** residential seasonal contracts are paid upfront and commercial is billed
+  monthly. Per-visit service is available, but seasonal is the better value.
+
+## Call handling
+
+| Call type | What the bot does | Tools |
+|---|---|---|
+| New service or quote | Qualifies in this order: residential or commercial, address or postal code (service area check), full season or one time. Then collects name, callback number, preferred contact method and access notes. Tells the caller the owner will call back within `[TIMEFRAME]` | `check_service_area` → `create_ticket(new_lead)` |
+| Outside the area | "Sorry, we don't cover that area…" No lead is logged | `check_service_area` |
+| Existing customer | Gets the address, pulls the record, asks what they need, logs it | `lookup_customer` → `create_ticket(existing_customer)` |
+| Complaint or missed pass | Apologizes, captures the address and what happened; the owner gets an SMS | `create_ticket(complaint)` |
+| Emergency (safety hazard, icy ramp, commercial access) | Priority One. Captures the address and callback number, then transfers to on-call | `create_ticket(emergency)` → `transfer_call(safety_hazard)` |
+| Wrong number or sales call | Ends the call politely | `end_call` |
+
+**Immediate transfers.** The bot transfers right away for:
+- a safety hazard, which goes to `ON_CALL_PHONE`, or `OWNER_PHONE` if that isn't set;
+- an angry customer, or one threatening to cancel;
+- a large commercial property: a mall, a condo board, or several lots;
+- a caller asking for the owner by name;
+- two failed attempts to understand the caller.
+
+All of these go to `OWNER_PHONE` except safety hazards. Before every transfer the owner gets
+an SMS with the reason. If the transfer isn't answered, the caller is told the owner will call
+back within the timeframe and the owner is texted.
+
+**Notifications.** Every ticket texts a confirmation to the caller. It also sends the owner a
+structured alert with the ticket type and number, name, address, service
+(property / service / contract), urgency, callback number and preferred contact, and any
+details or access notes.
+
+## Style
+
+- Replies are at most two short sentences unless the caller asks for detail.
+- Uses natural phrases: "got it," "okay," "one moment."
+- Doesn't volunteer that it's an AI. If a caller directly asks, it answers honestly.
+- The caller's words come from speech recognition, so unusual addresses are spelled back.
+  When the bot didn't understand, it says "I want to make sure I get this right. Can you repeat that?"
+- Life-threatening situations (injury, someone trapped, fire, downed lines) get "call 911
+  first" before anything else.
+
+## Error handling
+
+| Situation | Behavior |
 |---|---|
-| Residential and commercial customers | Call the business number and talk to the bot |
-| Dispatchers | Take transferred calls; read the queue and update job status through the dispatch API |
+| Silence for 5 s (`SILENCE_TIMEOUT_SECONDS`) | "Are you still there?" After `MAX_NO_INPUT_PROMPTS`, the bot hangs up |
+| Call drops or ends before the bot finishes | The status callback texts the caller: "Thanks for calling [COMPANY]. We got your number and will call you back shortly." The owner gets a DROPPED CALL alert. Skipped if a ticket (and its confirmation text) already went out |
+| Claude API error, refusal, truncated tool call, step limit | Apologizes, texts the owner CALLBACK NEEDED, and transfers to the owner. If no owner line is set, promises a callback and texts the caller |
+| Blocked or anonymous caller ID | No SMS is attempted to the caller |
 
-## Capabilities
+## Privacy
 
-1. **Book service.** Collect name, street address, town, service type (`driveway`,
-   `parking_lot`, `sidewalk`, `salting`), priority (`standard` / `urgent`) and driver notes.
-   Check the service area, read the details back, create the request only after the caller
-   confirms, and text a confirmation.
-2. **Check status.** Give the status and estimated arrival of the caller's requests.
-3. **Cancel.** Cancel a queued or assigned request. A request that is `en_route` goes to a dispatcher.
-4. **Transfer.** Connect the caller to `DISPATCHER_PHONE` when they ask for a person, raise
-   billing, pricing or damage, or need something the tools can't do. If no dispatcher line is
-   set, promise a callback instead.
-5. **Recognize returning callers.** Look them up by caller ID and offer their saved address.
-
-## Out of scope for v0.1
-
-- Quoting prices, taking payments, contracts.
-- Route optimization and truck GPS. The ETA is a queue-position heuristic.
-- Outbound calls. Outbound SMS covers booking confirmations and "on the way" texts.
-- Languages other than English.
-
-## Conversation rules
-
-- Output is spoken by TTS: one to three short sentences, no markdown or lists, one question at a time.
-- Speech recognition is imperfect: spell back or re-ask for unusual street names, house numbers and towns.
-- Always confirm before creating a request.
-- ETAs are estimates; never promise an exact time.
-- Emergencies (medical, someone trapped, fire, downed lines): tell the caller to hang up and dial 911.
-- **Privacy:** tools are scoped to the calling phone number. The model never supplies a phone
-  number, so a caller can't read or change someone else's request.
-- Off-topic requests are politely declined.
+`lookup_customer` reveals account details (name, address, notes) only when the caller is
+calling from the phone number on the account. When the match is by address from a different
+number, the model is told an account exists, but not whose it is.
 
 ## Architecture
 
 ```
-Caller ──PSTN──▶ Twilio ──webhook──▶ FastAPI (/voice/*)
-                                      │
-                                      ├─▶ DispatchAgent ──▶ Claude Messages API (tools)
-                                      │        │
-                                      │        └─▶ tools.py ──▶ SQLite (customers, requests, call_sessions)
-                                      │                     └─▶ Twilio SMS
-                                      ▼
-                              TwiML <Say>/<Gather>/<Dial>/<Hangup>
+Caller ──PSTN──▶ Twilio ──webhooks──▶ FastAPI (/voice/*)
+                                        │
+                                        ├─▶ DispatchAgent ──▶ Claude Messages API (strict tools)
+                                        │        └─▶ tools.py ──▶ SQLite (customers, tickets, call_sessions)
+                                        │                     └─▶ Twilio SMS (caller confirmations, owner alerts)
+                                        ▼
+                               TwiML <Gather>/<Say>/<Dial>/<Hangup>
 ```
 
-- **Speech in and out:** Twilio `<Gather input="speech">` does the speech-to-text (with
-  place-name hints) and `<Say>` with a Polly neural voice does the speech. Each caller
-  utterance is one webhook.
-- **State:** the conversation history for each call is stored in `call_sessions` and replayed
-  on every turn. It is append-only and never edited.
-- **Model:** `claude-opus-5` with adaptive thinking at `effort: low` for phone-call latency. It
-  sends `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`) so a policy decline is
-  retried server-side, and caches the stable system prompt and tools.
-- **Tools** (strict schemas, also checked with Pydantic):
-  `lookup_caller_account`, `check_service_area`, `create_service_request`,
-  `get_request_status`, `cancel_service_request`, `transfer_to_dispatcher`, `end_call`.
-- **Failure handling:** API errors, refusals, truncated tool calls and exceeding
-  `MAX_AGENT_STEPS` all end the same way. The bot apologizes and transfers the call, or asks
-  the caller to call back if no dispatcher line is set. A caller never hears silence or an
-  error tone.
-- **ETA:** `(floor(queue_position / TRUCK_COUNT) + 1) × MINUTES_PER_JOB`, with urgent jobs
-  ordered ahead of standard ones.
+- **Speech:** Twilio `<Gather input="speech">` recognizes speech, with hints for town and
+  service words, and `<Say>` speaks with a Polly neural voice. Each caller utterance is one
+  webhook, and the history for each call is stored and replayed append-only.
+- **Model:** `claude-opus-5` with adaptive thinking at `effort: low` for phone latency. It
+  sends `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`), and the system
+  prompt and tools are cached.
 
 ## Interfaces
 
 | Endpoint | Caller | Purpose |
 |---|---|---|
-| `POST /voice/incoming` | Twilio | Greet the caller and start listening |
-| `POST /voice/respond` | Twilio | Handle one utterance and reply |
-| `POST /voice/no-input` | Twilio | Re-prompt; hang up after `MAX_NO_INPUT_PROMPTS` |
-| `POST /voice/status` | Twilio | Status callback; close out the session |
-| `GET /dispatch/queue` | Dispatcher (Bearer token) | Open jobs in dispatch order, with ETAs |
-| `POST /dispatch/requests/{id}/status` | Dispatcher (Bearer token) | `queued` / `assigned` / `en_route` / `completed` / `cancelled`; `en_route` texts the customer |
+| `POST /voice/incoming` | Twilio (A call comes in) | Greet and listen |
+| `POST /voice/respond` | Twilio | One caller utterance in, one reply out |
+| `POST /voice/no-input` | Twilio | "Are you still there?" / hang up |
+| `POST /voice/dial-result` | Twilio | Handle an unanswered transfer |
+| `POST /voice/status` | Twilio (Call status changes) | Detect dropped calls and send the SMS |
+| `GET /dispatch/tickets` | Owner (Bearer token) | Open tickets, Priority One first |
+| `POST /dispatch/tickets/{id}/status` | Owner | `new` / `contacted` / `scheduled` / `closed` |
+| `GET` / `POST /dispatch/customers` | Owner | List customers and add them, so existing customers can be recognized |
 | `GET /healthz` | Monitoring | Liveness |
-
-Twilio webhooks are checked with `X-Twilio-Signature`. Behind a proxy, set `PUBLIC_BASE_URL`.
 
 ## Acceptance criteria
 
-- [x] A caller can book a driveway plow end to end, gets a request number and ETA, and receives an SMS.
-- [x] A request is never created for an address outside Erie or Niagara county.
-- [x] A caller can't see or cancel a request placed from another phone number.
-- [x] Urgent requests are queued ahead of standard ones.
-- [x] Model or API failures lead to a transfer or a polite hang-up, never dead air.
-- [x] Silence re-prompts, then hangs up.
-- [x] Forged Twilio webhooks are rejected.
-- [x] The dispatch API needs a token; setting `en_route` texts the customer.
+- [x] A new-lead call collects every qualifying field in the pack's order, logs a lead, texts
+  the caller, and sends the owner a structured alert.
+- [x] Addresses outside the service area are turned away without logging a lead.
+- [x] Emergencies are Priority One, sorted first, and transferred to on-call.
+- [x] Escalations go to the right person, and an unanswered transfer falls back to a promised callback.
+- [x] Silence gets "Are you still there?" after 5 seconds.
+- [x] Dropped calls text the caller once.
+- [x] Model or API failures never leave dead air.
+- [x] Account details are only read back to the account's own phone number.
+- [x] Forged Twilio webhooks are rejected, and the owner API needs a token.
 
 ## Future work
 
 - Stream audio over Twilio Media Streams for lower latency and barge-in.
-- A dispatcher web dashboard in place of the raw API.
-- Real routing and truck-position ETAs.
-- Evals built from recorded transcripts: booking accuracy, address capture and transfer precision.
+- Import customers from a CSV or a CRM.
+- Owner dashboard, and email alerts for callers who prefer email.
+- Evals built from real call transcripts: field capture accuracy and escalation precision/recall.

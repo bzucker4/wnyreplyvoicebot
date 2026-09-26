@@ -1,13 +1,27 @@
-"""Outbound SMS confirmations via the Twilio REST API."""
+"""Outbound SMS: caller confirmations and owner alerts, via the Twilio REST API."""
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Protocol
 
 from .config import Settings
 
 log = logging.getLogger(__name__)
+
+_E164_US = re.compile(r"^\+1\d{10}$")
+
+
+def normalize_phone(raw: str | None) -> str | None:
+    """Best-effort US number to E.164; None if it doesn't look like a real number."""
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        digits = "1" + digits
+    candidate = "+" + digits
+    return candidate if _E164_US.match(candidate) else None
 
 
 class SmsSender(Protocol):
@@ -38,7 +52,24 @@ class TwilioSmsSender:
             return False
 
 
+class Notifier:
+    """Sends texts only to numbers that look real (skips blocked/anonymous caller IDs)."""
+
+    def __init__(self, settings: Settings, sender: SmsSender) -> None:
+        self.settings = settings
+        self.sender = sender
+
+    def text(self, to: str | None, body: str) -> bool:
+        number = normalize_phone(to)
+        if not number:
+            return False
+        return self.sender.send(number, body)
+
+    def alert_owner(self, body: str) -> bool:
+        return self.text(self.settings.owner_phone, body)
+
+
 def build_sms_sender(settings: Settings) -> SmsSender:
-    if settings.send_sms_confirmations and settings.twilio_rest_enabled:
+    if settings.send_sms and settings.twilio_rest_enabled:
         return TwilioSmsSender(settings)
     return NullSmsSender()

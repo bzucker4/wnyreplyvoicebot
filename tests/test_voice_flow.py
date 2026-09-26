@@ -1,8 +1,9 @@
 import anthropic
 import httpx
+from conftest import ON_CALL, OWNER, message, text, tool_use
 from fastapi.testclient import TestClient
 
-from conftest import message, text, tool_use
+from snow_plow_dispatch_bot.agent import UNCLEAR_LINE, build_system_prompt
 
 CALLER = "+17165551234"
 
@@ -13,78 +14,95 @@ def post(client, path, **form):
     return client.post(path, data=form)
 
 
-def test_incoming_call_greets_and_listens(app):
+def test_system_prompt_fills_prompt_pack_placeholders(settings):
+    prompt = build_system_prompt(settings)
+    assert settings.company_name in prompt
+    assert "within 30 minutes to confirm and quote" in prompt
+    assert "Cheektowaga" in prompt and "140, 141, 142" in prompt
+    assert UNCLEAR_LINE in prompt
+    assert "[" + "COMPANY" not in prompt and "{" not in prompt
+
+
+def test_incoming_call_greets_and_listens_with_5s_silence_timeout(app):
     client = TestClient(app)
     r = post(client, "/voice/incoming")
     assert r.status_code == 200
-    body = r.text
-    assert "<Gather" in body and 'action="/voice/respond"' in body
-    assert "Thanks for calling" in body
-    assert '<Redirect method="POST">/voice/no-input</Redirect>' in body
+    assert "<Gather" in r.text and 'action="/voice/respond"' in r.text and 'timeout="5"' in r.text
+    assert "Thanks for calling" in r.text
+    assert '<Redirect method="POST">/voice/no-input</Redirect>' in r.text
 
 
-def test_full_booking_conversation(app, fake_client, db, sms):
+def test_new_lead_conversation(app, fake_client, db, sms):
     client = TestClient(app)
     post(client, "/voice/incoming")
 
-    # Turn 1: caller asks for a plow; Claude looks up the account, then asks for the address.
     fake_client.messages.script += [
-        message(tool_use("lookup_caller_account", {})),
-        message(text("I can help with that. What's the street address?")),
+        message(text("Sure. Is this for a residential driveway or a commercial property?")),
     ]
-    r = post(client, "/voice/respond", SpeechResult="I need my driveway plowed")
-    assert "What's the street address?" in r.text and "<Gather" in r.text
+    r = post(client, "/voice/respond", SpeechResult="Hi, I need a quote for plowing")
+    assert "residential driveway or a commercial property" in r.text and "<Gather" in r.text
 
     first_call = fake_client.messages.calls[0]
     assert first_call["model"] == "claude-opus-5"
     assert first_call["fallbacks"] == "default"
     assert first_call["output_config"] == {"effort": "low"}
-    first_user = first_call["messages"][0]["content"]
-    assert "<call_context>" in first_user[0]["text"] and "1234" in first_user[0]["text"]
-    assert first_user[1]["text"] == "Caller: I need my driveway plowed"
+    context = first_call["messages"][0]["content"][0]["text"]
+    assert "<call_context>" in context and "1234" in context
 
-    # Turn 2: caller confirms; Claude books it and reads back the number.
     fake_client.messages.script += [
-        message(tool_use("create_service_request", {
-            "customer_name": "Pat Kowalski", "service_address": "42 Elmwood Ave", "town": "Buffalo",
-            "zip_code": None, "service_type": "driveway", "priority": "standard", "notes": None,
+        message(tool_use("create_ticket", {
+            "call_type": "new_lead", "priority": "normal", "caller_name": "Pat Kowalski",
+            "callback_number": None, "preferred_contact": "call", "property_type": "residential",
+            "service_type": "driveway_plowing", "contract_type": "seasonal", "address": "42 Elmwood Ave",
+            "town": "Buffalo", "zip_code": None, "access_notes": None, "details": None,
         })),
-        message(text("You're all set. Request number one, about twenty-five minutes.")),
+        message(text("I've got your information. The owner will call you back within 30 minutes to confirm and quote.")),
     ]
-    r = post(client, "/voice/respond", SpeechResult="Yes that's right")
-    assert "Request number one" in r.text
-    assert db.get_request(1)["status"] == "queued"
-    assert len(sms.sent) == 1
+    r = post(client, "/voice/respond", SpeechResult="Nothing in the way, calling is best")
+    assert "within 30 minutes" in r.text
+    assert db.get_ticket(1)["call_type"] == "new_lead"
+    assert sms.to(OWNER) and sms.to(CALLER)
 
-    # History persisted across webhooks and is append-only.
+    # History persists across webhooks and is append-only.
     history = fake_client.messages.calls[-1]["messages"]
-    assert history[:4] == fake_client.messages.calls[1]["messages"] + [history[3]]
+    assert history[:3] == fake_client.messages.calls[1]["messages"]
 
-    # Turn 3: caller is done; Claude says goodbye and ends the call.
     fake_client.messages.script += [
-        message(text("Thanks for calling, stay warm!"), tool_use("end_call", {"summary": "booked #1"})),
+        message(text("Thanks for calling, stay warm."), tool_use("end_call", {"outcome": "lead_captured", "summary": "lead"})),
     ]
-    r = post(client, "/voice/respond", SpeechResult="That's all, thanks")
+    r = post(client, "/voice/respond", SpeechResult="That's it")
     assert "stay warm" in r.text and "<Hangup />" in r.text
-    assert db.get_or_create_session("CA123", CALLER).status == "completed"
+
+    # Normal hang-up after end_call: no dropped-call text.
+    sent_before = len(sms.sent)
+    post(client, "/voice/status", CallStatus="completed")
+    assert len(sms.sent) == sent_before
 
 
-def test_transfer_dials_dispatcher(app, fake_client):
+def test_emergency_transfers_to_on_call(app, fake_client):
     client = TestClient(app)
     fake_client.messages.script += [
-        message(text("Let me connect you with a dispatcher."),
-                tool_use("transfer_to_dispatcher", {"reason": "billing question"})),
+        message(text("Okay, connecting you to our on-call driver now."),
+                tool_use("transfer_call", {"reason": "safety_hazard", "details": "icy ramp"})),
     ]
-    r = post(client, "/voice/respond", SpeechResult="I have a question about my bill")
-    assert "<Dial" in r.text and "+17165550199" in r.text
+    r = post(client, "/voice/respond", SpeechResult="Our loading ramp is a sheet of ice")
+    assert "<Dial" in r.text and ON_CALL in r.text and 'action="/voice/dial-result"' in r.text
 
 
-def test_api_error_falls_back_to_dispatcher(app, fake_client):
+def test_unanswered_transfer_promises_callback(app, sms):
+    client = TestClient(app)
+    r = post(client, "/voice/dial-result", DialCallStatus="no-answer")
+    assert "call you back within 30 minutes" in r.text and "<Hangup />" in r.text
+    assert sms.to(OWNER)[0].startswith("MISSED TRANSFER")
+
+
+def test_api_error_hands_off_to_owner(app, fake_client, sms):
     client = TestClient(app)
     req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
     fake_client.messages.script.append(anthropic.APIConnectionError(request=req))
     r = post(client, "/voice/respond", SpeechResult="hello")
-    assert "having trouble" in r.text and "<Dial" in r.text
+    assert "having trouble" in r.text and "<Dial" in r.text and OWNER in r.text
+    assert sms.to(OWNER)[0].startswith("CALLBACK NEEDED")
 
 
 def test_refusal_is_not_spoken(app, fake_client, db):
@@ -92,21 +110,46 @@ def test_refusal_is_not_spoken(app, fake_client, db):
     fake_client.messages.script.append(message(stop_reason="refusal"))
     r = post(client, "/voice/respond", SpeechResult="hello")
     assert "having trouble" in r.text
-    session = db.get_or_create_session("CA123", CALLER)
-    assert session.messages[-1]["role"] == "assistant"
+    assert db.get_or_create_session("CA123", CALLER).messages[-1]["role"] == "assistant"
 
 
-def test_no_input_reprompts_then_hangs_up(app, settings):
+def test_silence_asks_are_you_still_there_then_hangs_up_and_texts(app, settings, sms):
     client = TestClient(app)
+    post(client, "/voice/incoming")
     for _ in range(settings.max_no_input_prompts):
         r = post(client, "/voice/no-input")
-        assert "didn't catch that" in r.text and "<Gather" in r.text
+        assert "Are you still there?" in r.text and "<Gather" in r.text
     r = post(client, "/voice/no-input")
     assert "<Hangup />" in r.text
+
+    post(client, "/voice/status", CallStatus="completed")
+    (drop_sms,) = sms.to(CALLER)
+    assert drop_sms == f"Thanks for calling {settings.company_name}. We got your number and will call you back shortly."
+    assert sms.to(OWNER)[0].startswith("DROPPED CALL")
+
+
+def test_dropped_call_after_ticket_does_not_double_text(app, fake_client, db, sms):
+    client = TestClient(app)
+    fake_client.messages.script += [
+        message(tool_use("create_ticket", {
+            "call_type": "complaint", "priority": "normal", "caller_name": None, "callback_number": None,
+            "preferred_contact": None, "property_type": None, "service_type": None, "contract_type": None,
+            "address": "42 Elmwood Ave", "town": None, "zip_code": None, "access_notes": None,
+            "details": "Missed pass this morning",
+        })),
+        message(text("I'm sorry about that. I've passed it to the owner.")),
+    ]
+    post(client, "/voice/respond", SpeechResult="You missed my driveway at 42 Elmwood")
+    texts_before = len(sms.to(CALLER))
+    post(client, "/voice/status", CallStatus="completed")
+    assert len(sms.to(CALLER)) == texts_before
+    assert db.get_or_create_session("CA123", CALLER).status == "dropped"
 
 
 def test_signature_validation_rejects_forged_requests(settings, db, fake_client, sms):
     from dataclasses import replace
+
+    from twilio.request_validator import RequestValidator
 
     from snow_plow_dispatch_bot.agent import DispatchAgent
     from snow_plow_dispatch_bot.app import create_app
@@ -117,28 +160,27 @@ def test_signature_validation_rejects_forged_requests(settings, db, fake_client,
     client = TestClient(app)
     assert post(client, "/voice/incoming").status_code == 403
 
-    from twilio.request_validator import RequestValidator
-
     form = {"CallSid": "CA9", "From": CALLER}
     sig = RequestValidator("tok").compute_signature("https://plow.example.com/voice/incoming", form)
-    r = client.post("/voice/incoming", data=form, headers={"X-Twilio-Signature": sig})
-    assert r.status_code == 200
+    assert client.post("/voice/incoming", data=form, headers={"X-Twilio-Signature": sig}).status_code == 200
 
 
-def test_dispatch_api(app, db, sms):
+def test_dispatch_api(app, db):
     client = TestClient(app)
-    assert client.get("/dispatch/queue").status_code == 401
+    assert client.get("/dispatch/tickets").status_code == 401
     auth = {"Authorization": "Bearer secret"}
 
-    customer = db.upsert_customer(CALLER, "Pat", "42 Elmwood Ave", "Buffalo", None)
-    db.create_request(customer["id"], None, "42 Elmwood Ave", "Buffalo", None, "driveway", "standard", None)
+    r = client.post("/dispatch/customers", headers=auth, json={
+        "name": "Pat Kowalski", "address": "42 Elmwood Ave", "phone": "(716) 555-1234",
+        "property_type": "residential", "plan": "seasonal"})
+    assert r.status_code == 201 and r.json()["phone"] == CALLER
+    assert len(client.get("/dispatch/customers", headers=auth).json()) == 1
 
-    queue = client.get("/dispatch/queue", headers=auth).json()
-    assert [r["id"] for r in queue] == [1] and queue[0]["eta_minutes"] == 25
+    db.create_ticket(call_type="new_lead", priority="normal", caller_phone=CALLER)
+    assert [t["id"] for t in client.get("/dispatch/tickets", headers=auth).json()] == [1]
 
-    r = client.post("/dispatch/requests/1/status", json={"status": "en_route"}, headers=auth)
-    assert r.status_code == 200 and r.json()["status"] == "en_route"
-    assert "on the way" in sms.sent[-1][1]
-
-    assert client.post("/dispatch/requests/1/status", json={"status": "bogus"}, headers=auth).status_code == 422
-    assert client.post("/dispatch/requests/99/status", json={"status": "completed"}, headers=auth).status_code == 404
+    r = client.post("/dispatch/tickets/1/status", json={"status": "closed"}, headers=auth)
+    assert r.status_code == 200 and r.json()["status"] == "closed"
+    assert client.get("/dispatch/tickets", headers=auth).json() == []
+    assert client.post("/dispatch/tickets/1/status", json={"status": "bogus"}, headers=auth).status_code == 422
+    assert client.post("/dispatch/tickets/99/status", json={"status": "closed"}, headers=auth).status_code == 404

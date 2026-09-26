@@ -1,29 +1,50 @@
-"""Tools Claude can call during a phone conversation.
-
-Every tool is scoped to the caller's own phone number: the model never passes
-a phone number, so a caller can only see or change their own requests.
-"""
+"""Tools Claude can call during a phone conversation."""
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
 from .config import Settings
-from .db import OPEN_STATUSES, PRIORITIES, SERVICE_TYPES, Database
+from .db import (
+    CALL_TYPES,
+    CONTACT_METHODS,
+    CONTRACT_TYPES,
+    PRIORITIES,
+    PROPERTY_TYPES,
+    SERVICE_TYPES,
+    Database,
+)
 from .service_area import check_service_area, normalize_town
-from .sms import SmsSender
+from .sms import Notifier, normalize_phone
 
 log = logging.getLogger(__name__)
+
+TRANSFER_REASONS = (
+    "safety_hazard",
+    "angry_or_cancelling",
+    "large_commercial",
+    "owner_requested",
+    "not_understood",
+    "caller_request",
+)
+CALL_OUTCOMES = ("lead_captured", "ticket_logged", "info_only", "out_of_area", "wrong_number", "sales_call", "other")
 
 
 def _nullable(schema: dict[str, Any]) -> dict[str, Any]:
     return {"anyOf": [schema, {"type": "null"}]}
+
+
+def _str(description: str | None = None) -> dict[str, Any]:
+    return {"type": "string", **({"description": description} if description else {})}
+
+
+def _enum(values: tuple[str, ...], description: str | None = None) -> dict[str, Any]:
+    return {"type": "string", "enum": list(values), **({"description": description} if description else {})}
 
 
 def _tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -42,114 +63,107 @@ def _tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     _tool(
-        "lookup_caller_account",
-        "Look up the account and recent plow requests tied to the phone number the caller "
-        "is calling from. Call this near the start of every call.",
-        {},
+        "lookup_customer",
+        "Pull an existing customer's record by the number they are calling from and, if given, "
+        "the service address they said. Use when the caller says they are already a customer.",
+        {"address": _nullable(_str("Street address the caller gave, e.g. '42 Elmwood Ave'."))},
     ),
     _tool(
         "check_service_area",
-        "Check whether a town or ZIP code is inside the plowing service area "
-        "(Erie and Niagara counties, NY). Call before creating a request for a new address.",
+        "Check whether a town or ZIP/postal code is inside the service area. Call as soon as a "
+        "new caller gives their address or postal code.",
+        {"town": _nullable(_str()), "zip_code": _nullable(_str())},
+    ),
+    _tool(
+        "create_ticket",
+        "Log the call for the owner and send the caller an SMS confirmation. Call once you have "
+        "the required details: new_lead needs name, property type, address, contract type, "
+        "callback number and preferred contact; emergency needs address and callback number; "
+        "complaint and existing_customer need address and what they need. Use null for anything "
+        "the caller did not give.",
         {
-            "town": {"type": "string", "description": "Town, city, or village name, e.g. 'Cheektowaga'."},
-            "zip_code": _nullable({"type": "string", "description": "5-digit ZIP code if the caller gave one."}),
+            "call_type": _enum(CALL_TYPES),
+            "priority": _enum(PRIORITIES, "'priority_one' only for emergencies."),
+            "caller_name": _nullable(_str()),
+            "callback_number": _nullable(_str("Only if different from the number they are calling from.")),
+            "preferred_contact": _nullable(_enum(CONTACT_METHODS)),
+            "property_type": _nullable(_enum(PROPERTY_TYPES)),
+            "service_type": _nullable(_enum(SERVICE_TYPES)),
+            "contract_type": _nullable(_enum(CONTRACT_TYPES)),
+            "address": _nullable(_str()),
+            "town": _nullable(_str()),
+            "zip_code": _nullable(_str()),
+            "access_notes": _nullable(_str("Cars to move, narrow entrance, obstacles under the snow.")),
+            "details": _nullable(_str("What the caller needs, the complaint, or the hazard, in one or two sentences.")),
         },
     ),
     _tool(
-        "create_service_request",
-        "Create a plow or salting request and add it to the dispatch queue. Only call after "
-        "reading the address and service back to the caller and hearing them confirm it.",
-        {
-            "customer_name": {"type": "string", "description": "Caller's full name."},
-            "service_address": {"type": "string", "description": "Street address to plow, e.g. '123 Main St'."},
-            "town": {"type": "string"},
-            "zip_code": _nullable({"type": "string"}),
-            "service_type": {"type": "string", "enum": list(SERVICE_TYPES)},
-            "priority": {
-                "type": "string",
-                "enum": list(PRIORITIES),
-                "description": "'urgent' only when someone must get out soon for work shifts, "
-                "medical appointments, or a business opening; otherwise 'standard'.",
-            },
-            "notes": _nullable({
-                "type": "string",
-                "description": "Anything the driver needs: gate codes, parked cars, where to pile snow.",
-            }),
-        },
-    ),
-    _tool(
-        "get_request_status",
-        "Get the status and estimated arrival for one of the caller's plow requests. Pass "
-        "null for request_id to get their most recent open request.",
-        {"request_id": _nullable({"type": "integer"})},
-    ),
-    _tool(
-        "cancel_service_request",
-        "Cancel one of the caller's open plow requests after they confirm they want to cancel it.",
-        {"request_id": {"type": "integer"}},
-    ),
-    _tool(
-        "transfer_to_dispatcher",
-        "Transfer the call to a human dispatcher. Use when the caller asks for a person, has "
-        "a billing or damage complaint, or needs something these tools cannot do.",
-        {"reason": {"type": "string"}},
+        "transfer_call",
+        "Transfer the call to a person right away. Safety hazards go to the on-call line; "
+        "everything else goes to the owner. Create an emergency ticket first when there is a "
+        "safety hazard and you have the address and callback number.",
+        {"reason": _enum(TRANSFER_REASONS), "details": _str("One sentence for the person picking up.")},
     ),
     _tool(
         "end_call",
-        "Hang up after saying goodbye, once the caller has nothing else they need.",
-        {"summary": {"type": "string", "description": "One-sentence summary of the call for the log."}},
+        "Hang up after your goodbye, once the caller has nothing else they need.",
+        {"outcome": _enum(CALL_OUTCOMES), "summary": _str("One-sentence summary for the call log.")},
     ),
 ]
 
 
 # -- input validation ---------------------------------------------------------
-# Strict tool use already constrains the schema; these models also guard
-# length/format, and keep the executor safe if strict mode is turned off.
+# Strict tool use constrains the schema; these models also bound lengths and
+# keep the executor safe if strict mode is ever turned off.
 
-class _Empty(BaseModel):
-    model_config = {"extra": "forbid"}
-
-
-class _ServiceAreaInput(BaseModel):
-    town: str = Field(max_length=80)
-    zip_code: str | None = Field(default=None, max_length=10)
+class _LookupInput(BaseModel):
+    address: str | None = Field(default=None, max_length=200)
 
 
-class _CreateInput(BaseModel):
-    customer_name: str = Field(min_length=1, max_length=120)
-    service_address: str = Field(min_length=3, max_length=200)
-    town: str = Field(min_length=1, max_length=80)
-    zip_code: str | None = Field(default=None, max_length=10)
-    service_type: Literal["driveway", "parking_lot", "sidewalk", "salting"]
-    priority: Literal["standard", "urgent"]
-    notes: str | None = Field(default=None, max_length=500)
+class _AreaInput(BaseModel):
+    town: str | None = Field(default=None, max_length=80)
+    zip_code: str | None = Field(default=None, max_length=12)
 
 
-class _StatusInput(BaseModel):
-    request_id: int | None = None
-
-
-class _CancelInput(BaseModel):
-    request_id: int
+class _TicketInput(BaseModel):
+    call_type: Literal["new_lead", "existing_customer", "complaint", "emergency"]
+    priority: Literal["normal", "priority_one"]
+    caller_name: str | None = Field(default=None, max_length=120)
+    callback_number: str | None = Field(default=None, max_length=30)
+    preferred_contact: Literal["call", "text", "email"] | None = None
+    property_type: Literal["residential", "commercial"] | None = None
+    service_type: Literal["driveway_plowing", "lot_plowing", "sidewalk_clearing", "deicing"] | None = None
+    contract_type: Literal["seasonal", "one_time", "undecided"] | None = None
+    address: str | None = Field(default=None, max_length=200)
+    town: str | None = Field(default=None, max_length=80)
+    zip_code: str | None = Field(default=None, max_length=12)
+    access_notes: str | None = Field(default=None, max_length=500)
+    details: str | None = Field(default=None, max_length=500)
 
 
 class _TransferInput(BaseModel):
-    reason: str = Field(max_length=300)
+    reason: Literal[TRANSFER_REASONS]  # type: ignore[valid-type]
+    details: str = Field(max_length=300)
 
 
 class _EndInput(BaseModel):
+    outcome: Literal[CALL_OUTCOMES]  # type: ignore[valid-type]
     summary: str = Field(max_length=500)
 
 
 _INPUT_MODELS: dict[str, type[BaseModel]] = {
-    "lookup_caller_account": _Empty,
-    "check_service_area": _ServiceAreaInput,
-    "create_service_request": _CreateInput,
-    "get_request_status": _StatusInput,
-    "cancel_service_request": _CancelInput,
-    "transfer_to_dispatcher": _TransferInput,
+    "lookup_customer": _LookupInput,
+    "check_service_area": _AreaInput,
+    "create_ticket": _TicketInput,
+    "transfer_call": _TransferInput,
     "end_call": _EndInput,
+}
+
+_REQUIRED_BY_CALL_TYPE = {
+    "new_lead": ("caller_name", "property_type", "address", "contract_type", "preferred_contact"),
+    "emergency": ("address",),
+    "complaint": ("address", "details"),
+    "existing_customer": ("address", "details"),
 }
 
 
@@ -157,19 +171,24 @@ _INPUT_MODELS: dict[str, type[BaseModel]] = {
 
 @dataclass
 class CallControl:
-    """Side effects a tool asks the voice layer to perform after Claude's reply is spoken."""
+    """What the voice layer should do after Claude's reply is spoken."""
 
-    transfer: bool = False
+    transfer_to: str | None = None
     transfer_reason: str | None = None
     hang_up: bool = False
+    outcome: str | None = None
     summary: str | None = None
+
+    @property
+    def ends_turn_taking(self) -> bool:
+        return self.hang_up or self.transfer_to is not None
 
 
 @dataclass
 class ToolContext:
     db: Database
     settings: Settings
-    sms: SmsSender
+    notifier: Notifier
     call_sid: str
     caller_phone: str
     control: CallControl = field(default_factory=CallControl)
@@ -179,148 +198,146 @@ class ToolError(Exception):
     """An error message that is safe to show the model."""
 
 
-def estimate_eta_minutes(db: Database, settings: Settings, request_id: int) -> int | None:
-    """Rough ETA: jobs ahead of this one, spread across the trucks on the road."""
-    queue = db.open_queue()
-    position = next((i for i, r in enumerate(queue) if r["id"] == request_id), None)
-    if position is None:
-        return None
-    trucks = max(settings.truck_count, 1)
-    rounds = math.floor(position / trucks) + 1
-    return rounds * settings.minutes_per_job
+def _label(value: str | None) -> str:
+    return value.replace("_", " ") if value else "?"
 
 
-def _format_eta(minutes: int | None) -> str | None:
-    if minutes is None:
-        return None
-    if minutes < 60:
-        return f"about {minutes} minutes"
-    hours = round(minutes / 60 * 2) / 2
-    return f"about {hours:g} hours"
+def format_owner_alert(t: dict[str, Any]) -> str:
+    """Structured owner alert: name, address, service type, urgency, and how to reach them."""
+    head = {
+        "new_lead": "NEW LEAD",
+        "existing_customer": "CUSTOMER REQUEST",
+        "complaint": "COMPLAINT",
+        "emergency": "PRIORITY ONE EMERGENCY",
+    }[t["call_type"]]
+    address = ", ".join(p for p in (t["address"], t["town"], t["zip_code"]) if p) or "?"
+    service = " / ".join(_label(v) for v in (t["property_type"], t["service_type"], t["contract_type"]) if v) or "?"
+    lines = [
+        f"{head} #{t['id']}",
+        f"Name: {t['caller_name'] or '?'}",
+        f"Address: {address}",
+        f"Service: {service}",
+        f"Urgency: {'PRIORITY ONE' if t['priority'] == 'priority_one' else 'normal'}",
+        f"Callback: {t['callback_number'] or t['caller_phone'] or '?'} (prefers {t['preferred_contact'] or '?'})",
+    ]
+    if t["details"]:
+        lines.append(f"Details: {t['details']}")
+    if t["access_notes"]:
+        lines.append(f"Access: {t['access_notes']}")
+    return "\n".join(lines)
 
 
-def _public_request(db: Database, settings: Settings, r: dict[str, Any]) -> dict[str, Any]:
-    out = {
-        "request_id": r["id"],
-        "service_address": r["service_address"],
-        "town": r["town"],
-        "service_type": r["service_type"],
-        "priority": r["priority"],
-        "status": r["status"],
-        "created_at": r["created_at"],
+def _lookup_customer(ctx: ToolContext, args: _LookupInput) -> dict[str, Any]:
+    matches = ctx.db.find_customers(phone=normalize_phone(ctx.caller_phone), address=args.address)
+    if not matches:
+        return {"found": False, "message": "No record for this number or address. Treat as a new caller or ask them to spell the address."}
+    c = matches[0]
+    caller_verified = normalize_phone(c["phone"]) == normalize_phone(ctx.caller_phone)
+    record: dict[str, Any] = {
+        "found": True,
+        "matched_on": "phone" if caller_verified else "address",
+        "customer_id": c["id"],
+        "property_type": c["property_type"],
+        "plan": c["plan"],
+        "open_tickets": len(ctx.db.open_tickets(customer_id=c["id"], caller_phone=ctx.caller_phone)),
     }
-    if r["status"] in OPEN_STATUSES:
-        out["estimated_arrival"] = _format_eta(estimate_eta_minutes(db, settings, r["id"]))
-    return out
+    if caller_verified:
+        # Only reveal account details to the phone number on the account.
+        record.update(name=c["name"], address=c["address"], town=c["town"], notes=c["notes"])
+    else:
+        record["message"] = "Calling from a different number than the one on file: do not read back account details; ask for their name."
+    return record
 
 
-def _owned_request(ctx: ToolContext, request_id: int) -> dict[str, Any]:
-    r = ctx.db.get_request(request_id)
-    if not r or r["customer_phone"] != ctx.caller_phone:
-        raise ToolError(f"No request #{request_id} found for this caller's phone number.")
-    return r
+def _check_service_area(ctx: ToolContext, args: _AreaInput) -> dict[str, Any]:
+    if not args.town and not args.zip_code:
+        raise ToolError("Provide a town or a ZIP code.")
+    return check_service_area(args.town, args.zip_code, ctx.settings.service_towns, ctx.settings.service_zip_prefixes)
 
 
-def _lookup_caller_account(ctx: ToolContext, _: _Empty) -> dict[str, Any]:
-    customer = ctx.db.get_customer_by_phone(ctx.caller_phone)
-    if not customer:
-        return {"existing_customer": False}
-    requests = ctx.db.list_requests_for_phone(ctx.caller_phone)
-    return {
-        "existing_customer": True,
-        "name": customer["name"],
-        "default_address": customer["default_address"],
-        "town": customer["town"],
-        "recent_requests": [_public_request(ctx.db, ctx.settings, r) for r in requests[:3]],
-    }
+def _create_ticket(ctx: ToolContext, args: _TicketInput) -> dict[str, Any]:
+    missing = [f for f in _REQUIRED_BY_CALL_TYPE[args.call_type] if not getattr(args, f)]
+    if missing:
+        raise ToolError(f"Missing {', '.join(missing)}. Ask the caller for it before logging this call.")
+    if args.call_type == "new_lead":
+        if not args.town and not args.zip_code:
+            raise ToolError("Missing town or ZIP code. Ask for it so the service area can be checked.")
+        area = check_service_area(args.town, args.zip_code, ctx.settings.service_towns, ctx.settings.service_zip_prefixes)
+        if not area["in_service_area"]:
+            raise ToolError("Outside the service area. Do not log a lead; tell the caller we don't cover that area.")
 
+    callback = normalize_phone(args.callback_number) or args.callback_number or ctx.caller_phone
+    customer_id = None
+    if args.call_type in ("existing_customer", "complaint", "emergency"):
+        matches = ctx.db.find_customers(phone=normalize_phone(ctx.caller_phone), address=args.address)
+        customer_id = matches[0]["id"] if matches else None
 
-def _check_service_area(ctx: ToolContext, args: _ServiceAreaInput) -> dict[str, Any]:
-    return check_service_area(args.town, args.zip_code)
-
-
-def _create_service_request(ctx: ToolContext, args: _CreateInput) -> dict[str, Any]:
-    area = check_service_area(args.town, args.zip_code)
-    if not area["in_service_area"]:
-        raise ToolError(
-            f"{args.town} is outside the service area (Erie and Niagara counties). "
-            "Do not create the request; offer to transfer to a dispatcher instead."
-        )
-    town = normalize_town(args.town).title()
-    customer = ctx.db.upsert_customer(
-        ctx.caller_phone, args.customer_name.strip(), args.service_address.strip(), town, args.zip_code
-    )
-    request = ctx.db.create_request(
-        customer_id=customer["id"],
+    ticket = ctx.db.create_ticket(
         call_sid=ctx.call_sid,
-        service_address=args.service_address.strip(),
-        town=town,
-        zip_code=args.zip_code,
+        call_type=args.call_type,
+        priority="priority_one" if args.call_type == "emergency" else args.priority,
+        customer_id=customer_id,
+        caller_phone=ctx.caller_phone,
+        caller_name=args.caller_name,
+        callback_number=callback,
+        preferred_contact=args.preferred_contact,
+        property_type=args.property_type,
         service_type=args.service_type,
-        priority=args.priority,
-        notes=args.notes,
+        contract_type=args.contract_type,
+        address=args.address,
+        town=normalize_town(args.town).title() if args.town else None,
+        zip_code=args.zip_code,
+        access_notes=args.access_notes,
+        details=args.details,
     )
-    eta = _format_eta(estimate_eta_minutes(ctx.db, ctx.settings, request["id"]))
-    sms_sent = ctx.sms.send(
-        ctx.caller_phone,
-        f"{ctx.settings.company_name}: request #{request['id']} received for "
-        f"{request['service_address']}, {town} ({args.service_type.replace('_', ' ')}). "
-        f"Estimated arrival {eta or 'to be confirmed'}. Reply or call back to change it.",
+
+    s = ctx.settings
+    owner_alerted = ctx.notifier.alert_owner(format_owner_alert(ticket))
+    confirm_to = callback if normalize_phone(callback) else ctx.caller_phone
+    caller_texted = ctx.notifier.text(
+        confirm_to,
+        f"Thanks for calling {s.company_name}. We've got your request (#{ticket['id']}) and the "
+        f"owner will call you back within {s.callback_timeframe}.",
     )
     return {
-        "request_id": request["id"],
-        "status": request["status"],
-        "estimated_arrival": eta,
-        "sms_confirmation_sent": sms_sent,
+        "ticket_id": ticket["id"],
+        "priority": ticket["priority"],
+        "owner_alerted": owner_alerted,
+        "caller_sms_sent": caller_texted,
+        "callback_timeframe": s.callback_timeframe,
     }
 
 
-def _get_request_status(ctx: ToolContext, args: _StatusInput) -> dict[str, Any]:
-    if args.request_id is not None:
-        return _public_request(ctx.db, ctx.settings, _owned_request(ctx, args.request_id))
-    open_requests = ctx.db.list_requests_for_phone(ctx.caller_phone, open_only=True)
-    if not open_requests:
-        return {"open_request": None, "message": "This caller has no open requests."}
-    return _public_request(ctx.db, ctx.settings, open_requests[0])
-
-
-def _cancel_service_request(ctx: ToolContext, args: _CancelInput) -> dict[str, Any]:
-    r = _owned_request(ctx, args.request_id)
-    if r["status"] not in OPEN_STATUSES:
-        raise ToolError(f"Request #{r['id']} is already {r['status']} and cannot be cancelled.")
-    if r["status"] == "en_route":
-        raise ToolError(
-            f"A truck is already on the way to request #{r['id']}; transfer to a dispatcher to cancel."
-        )
-    updated = ctx.db.update_request_status(r["id"], "cancelled")
-    return {"request_id": updated["id"], "status": updated["status"]}
-
-
-def _transfer_to_dispatcher(ctx: ToolContext, args: _TransferInput) -> dict[str, Any]:
-    if not ctx.settings.dispatcher_phone:
+def _transfer_call(ctx: ToolContext, args: _TransferInput) -> dict[str, Any]:
+    s = ctx.settings
+    target = s.emergency_phone if args.reason == "safety_hazard" else s.owner_phone
+    ctx.notifier.alert_owner(
+        f"{'PRIORITY ONE ' if args.reason == 'safety_hazard' else ''}TRANSFER ({_label(args.reason)}) "
+        f"from {ctx.caller_phone}: {args.details}"
+    )
+    if not target:
         return {
             "transferred": False,
-            "message": "No dispatcher line is staffed right now. Tell the caller a dispatcher "
-            "will call them back at this number, then end the call.",
+            "message": f"Nobody can take a live transfer right now. The owner has been texted. Tell the "
+            f"caller the owner will call them back within {s.callback_timeframe}, then end the call.",
         }
-    ctx.control.transfer = True
+    ctx.control.transfer_to = target
     ctx.control.transfer_reason = args.reason
-    return {"transferred": True, "message": "Tell the caller you are connecting them now."}
+    return {"transferred": True, "message": "Tell the caller you're connecting them now, in one short sentence."}
 
 
 def _end_call(ctx: ToolContext, args: _EndInput) -> dict[str, Any]:
     ctx.control.hang_up = True
+    ctx.control.outcome = args.outcome
     ctx.control.summary = args.summary
-    return {"ok": True, "message": "Say a short goodbye; the call will end after you speak."}
+    return {"ok": True, "message": "Say a short goodbye; the call ends after you speak."}
 
 
 _HANDLERS = {
-    "lookup_caller_account": _lookup_caller_account,
+    "lookup_customer": _lookup_customer,
     "check_service_area": _check_service_area,
-    "create_service_request": _create_service_request,
-    "get_request_status": _get_request_status,
-    "cancel_service_request": _cancel_service_request,
-    "transfer_to_dispatcher": _transfer_to_dispatcher,
+    "create_ticket": _create_ticket,
+    "transfer_call": _transfer_call,
     "end_call": _end_call,
 }
 
@@ -339,4 +356,4 @@ def execute_tool(ctx: ToolContext, name: str, raw_input: Any) -> tuple[str, bool
         return json.dumps({"error": str(e)}), True
     except Exception:
         log.exception("tool %s failed", name)
-        return json.dumps({"error": "Internal error; apologize and offer a dispatcher."}), True
+        return json.dumps({"error": "Internal error. Take the caller's number and say the owner will call back."}), True
