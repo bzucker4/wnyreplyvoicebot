@@ -1,13 +1,15 @@
 [project]
 name = "snow_plow_dispatch_bot"
 version = "0.1.0"
-description = "AI voice agent that takes snow plow requests over the phone for a Western New York dispatch service"
+description = "Multi-business AI phone dispatcher for snow removal companies (WNYReply)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=1.8,<2",
     "fastapi>=0.115",
+    "psycopg[binary]>=3.2",
     "python-multipart>=0.0.9",
+    "sqlalchemy>=2.0",
     "twilio>=9.0",
     "uvicorn[standard]>=0.30",
 ]

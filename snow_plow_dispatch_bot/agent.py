@@ -19,8 +19,9 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 
+from .business import BusinessProfile
 from .config import Settings
-from .db import CallSession
+from .storage import CallSession
 from .tools import TOOL_DEFINITIONS, CallControl, ToolContext, execute_tool
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,12 @@ GREETING = "Thanks for calling {company}. How can I help you?"
 UNCLEAR_LINE = "I want to make sure I get this right. Can you repeat that?"
 SORRY_LINE = "Sorry, I'm having trouble on my end."
 
-# Built from the voice prompt pack. Bracketed placeholders are filled from Settings.
+# The voice prompt pack's default price ranges; a business's own price_bands override them.
+PACK_PRICE_BANDS = """\
+Residential: $40 to $100 per visit, or $300 to $650 for the season.
+Commercial: $100 to $400 or more per visit."""
+
+# Built from the voice prompt pack. Bracketed placeholders are filled per business.
 SYSTEM_PROMPT = """\
 [IDENTITY]
 You are the 24/7 dispatch assistant for {company}, a snow removal company serving {service_area}. \
@@ -41,15 +47,17 @@ Your job is to answer every call, qualify the caller, and either book the job, c
 escalate an emergency. You are calm, efficient, and sound like a real person, not a phone menu.
 
 [CONTEXT]
-- Service area: {service_area}. Towns: {towns}. ZIP codes starting with {zip_prefixes}.
+- Service area: {service_area}.{area_detail}
 - Services: residential driveway plowing, commercial lot plowing, sidewalk clearing, de-icing.
 - Trigger depths: residential is 2 inches. Commercial is 1 inch, or per contract.
-- Pricing ranges: residential is $40 to $100 per visit, or $300 to $650 for the season. Commercial \
-is $100 to $400 or more per visit. Only ever give these ranges. Never quote an exact price; the \
-owner quotes on the callback.
+- Pricing: only ever give the ranges in <price_bands>, spoken in words. Never quote an exact \
+price; the owner quotes on the callback.
+<price_bands>
+{price_bands}
+</price_bands>
 - Seasonal vs per-visit: residential seasonal contracts are paid upfront. Commercial is billed \
-monthly. Per-visit is available, but seasonal is the better value.
-- Owner: {owners}.
+monthly. Per-visit is available, but {contract_pitch} is the better value.
+- Owner: {owners}.{booking_line}
 
 [STYLE]
 Everything you write is spoken aloud by a phone voice. Latency-sensitive; begin your visible answer \
@@ -119,29 +127,41 @@ class TurnResult:
     control: CallControl
 
 
-def build_system_prompt(settings: Settings) -> str:
+def build_system_prompt(business: BusinessProfile) -> str:
+    area_detail = ""
+    if business.service_towns:
+        area_detail += " Towns: " + ", ".join(t.title() for t in business.service_towns) + "."
+    if business.service_zip_prefixes:
+        area_detail += " ZIP codes starting with " + ", ".join(business.service_zip_prefixes) + "."
+    booking_line = ""
+    if business.booking_link:
+        booking_line = ("\n- Online booking: if a caller wants to book right away, offer to text them the "
+                        "booking link with send_booking_link. Never read a link out loud.")
+    contract = business.default_contract_type or "seasonal"
     return SYSTEM_PROMPT.format(
-        company=settings.company_name,
-        service_area=settings.service_area_description,
-        towns=", ".join(t.title() for t in settings.service_towns),
-        zip_prefixes=", ".join(settings.service_zip_prefixes),
-        timeframe=settings.callback_timeframe,
-        owners=", ".join(settings.owner_names) or "not named",
+        company=business.name,
+        service_area=business.service_area,
+        area_detail=area_detail,
+        price_bands=business.price_bands or PACK_PRICE_BANDS,
+        contract_pitch="seasonal" if contract == "seasonal" else contract.replace("_", " "),
+        booking_line=booking_line,
+        timeframe=business.callback_timeframe,
+        owners=", ".join(business.owner_names) or "not named",
         unclear=UNCLEAR_LINE,
     )
 
 
-def greeting(settings: Settings) -> str:
-    return GREETING.format(company=settings.company_name)
+def greeting(business: BusinessProfile) -> str:
+    return GREETING.format(company=business.name)
 
 
-def _call_context(settings: Settings, caller_phone: str, now: datetime) -> str:
+def _call_context(business: BusinessProfile, caller_phone: str, now: datetime) -> str:
     last4 = re.sub(r"\D", "", caller_phone)[-4:] or "unknown"
     return (
         "<call_context>\n"
         f"Caller phone number ends in: {last4}\n"
         f"Local time in Buffalo: {now.strftime('%A %B %-d, %-I:%M %p')}\n"
-        f'You already greeted the caller with: "{greeting(settings)}"\n'
+        f'You already greeted the caller with: "{greeting(business)}"\n'
         "</call_context>"
     )
 
@@ -164,13 +184,12 @@ class DispatchAgent:
             timeout=settings.anthropic_timeout_seconds,
             max_retries=settings.anthropic_max_retries,
         )
-        self.system_prompt = build_system_prompt(settings)
 
-    def _create(self, messages: list[dict[str, Any]]) -> Any:
+    def _create(self, business: BusinessProfile, messages: list[dict[str, Any]]) -> Any:
         return self.client.beta.messages.create(
             model=self.settings.anthropic_model,
             max_tokens=16000,
-            system=self.system_prompt,
+            system=build_system_prompt(business),
             tools=TOOL_DEFINITIONS,
             messages=messages,
             thinking={"type": "adaptive"},
@@ -192,13 +211,13 @@ class DispatchAgent:
         user_content: list[dict[str, Any]] = []
         if not messages:
             now = now or datetime.now(LOCAL_TZ)
-            user_content.append({"type": "text", "text": _call_context(self.settings, session.caller_phone, now)})
+            user_content.append({"type": "text", "text": _call_context(ctx.business, session.caller_phone, now)})
         user_content.append({"type": "text", "text": f"Caller: {caller_text}"})
         messages.append({"role": "user", "content": user_content})
 
         for _ in range(self.settings.max_agent_steps):
             try:
-                response = self._create(messages)
+                response = self._create(ctx.business, messages)
             except anthropic.APIError:
                 log.exception("Claude request failed for call %s", session.call_sid)
                 return self._give_up(messages, ctx)
@@ -243,16 +262,16 @@ class DispatchAgent:
 
     def _give_up(self, messages: list[dict[str, Any]], ctx: ToolContext) -> TurnResult:
         """Never leave the caller in dead air: hand off to the owner, or promise a callback."""
-        s = ctx.settings
+        b = ctx.business
         ctx.notifier.alert_owner(f"CALLBACK NEEDED: the phone assistant hit an error on a call from {ctx.caller_phone}.")
-        if s.owner_phone:
-            ctx.control.transfer_to = s.owner_phone
+        if b.alert_phone:
+            ctx.control.transfer_to = b.alert_phone
             ctx.control.transfer_reason = "agent_error"
             speech = f"{SORRY_LINE} Let me connect you with the owner."
         else:
             ctx.control.hang_up = True
             ctx.control.outcome = "other"
-            ctx.notifier.text(ctx.caller_phone, f"Thanks for calling {s.company_name}. We got your number and will call you back shortly.")
+            ctx.notifier.text(ctx.caller_phone, f"Thanks for calling {b.name}. We got your number and will call you back shortly.")
             speech = f"{SORRY_LINE} The owner will call you back shortly at this number."
         if messages and messages[-1]["role"] == "user":
             messages.append({"role": "assistant", "content": [{"type": "text", "text": speech}]})

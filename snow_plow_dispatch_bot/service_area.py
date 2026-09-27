@@ -1,11 +1,12 @@
-"""Service area checks. Defaults cover Buffalo and the Erie/Niagara county suburbs."""
+"""Service area checks against a business's town list and ZIP prefixes."""
 
 from __future__ import annotations
 
 import re
 from typing import Iterable
 
-DEFAULT_SERVICE_TOWNS: tuple[str, ...] = (
+# Handy seed values for a Buffalo-area business (Erie and Niagara counties).
+WNY_TOWNS: tuple[str, ...] = (
     "alden", "amherst", "aurora", "blasdell", "boston", "buffalo", "cheektowaga",
     "clarence", "depew", "east aurora", "eden", "elma", "evans", "grand island",
     "hamburg", "kenmore", "lackawanna", "lancaster", "lewiston", "lockport",
@@ -13,9 +14,7 @@ DEFAULT_SERVICE_TOWNS: tuple[str, ...] = (
     "snyder", "tonawanda", "wales", "west seneca", "wheatfield", "williamsville",
     "youngstown",
 )
-
-# 140xx-142xx: Buffalo and the surrounding Erie/Niagara county suburbs.
-DEFAULT_ZIP_PREFIXES: tuple[str, ...] = ("140", "141", "142")
+WNY_ZIP_PREFIXES: tuple[str, ...] = ("140", "141", "142")
 
 
 def normalize_town(town: str) -> str:
@@ -29,8 +28,8 @@ def normalize_town(town: str) -> str:
 def check_service_area(
     town: str | None,
     zip_code: str | None,
-    towns: Iterable[str] = DEFAULT_SERVICE_TOWNS,
-    zip_prefixes: Iterable[str] = DEFAULT_ZIP_PREFIXES,
+    towns: Iterable[str],
+    zip_prefixes: Iterable[str],
 ) -> dict:
     normalized = normalize_town(town) if town else ""
     zip_clean = re.sub(r"\D", "", zip_code or "")

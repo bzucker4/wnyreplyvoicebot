@@ -9,8 +9,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .config import Settings
-from .db import (
+from .business import BusinessProfile
+from .service_area import check_service_area, normalize_town
+from .sms import Notifier, normalize_phone
+from .storage import (
     CALL_TYPES,
     CONTACT_METHODS,
     CONTRACT_TYPES,
@@ -19,8 +21,6 @@ from .db import (
     SERVICE_TYPES,
     Database,
 )
-from .service_area import check_service_area, normalize_town
-from .sms import Notifier, normalize_phone
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +75,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         {"town": _nullable(_str()), "zip_code": _nullable(_str())},
     ),
     _tool(
+        "send_booking_link",
+        "Text the caller this business's online booking link. Offer it to callers who want to "
+        "book right away; never read a link out loud.",
+        {},
+    ),
+    _tool(
         "create_ticket",
         "Log the call for the owner and send the caller an SMS confirmation. Call once you have "
         "the required details: new_lead needs name, property type, address, contract type, "
@@ -120,6 +126,10 @@ class _LookupInput(BaseModel):
     address: str | None = Field(default=None, max_length=200)
 
 
+class _Empty(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
 class _AreaInput(BaseModel):
     town: str | None = Field(default=None, max_length=80)
     zip_code: str | None = Field(default=None, max_length=12)
@@ -154,6 +164,7 @@ class _EndInput(BaseModel):
 _INPUT_MODELS: dict[str, type[BaseModel]] = {
     "lookup_customer": _LookupInput,
     "check_service_area": _AreaInput,
+    "send_booking_link": _Empty,
     "create_ticket": _TicketInput,
     "transfer_call": _TransferInput,
     "end_call": _EndInput,
@@ -187,7 +198,7 @@ class CallControl:
 @dataclass
 class ToolContext:
     db: Database
-    settings: Settings
+    business: BusinessProfile
     notifier: Notifier
     call_sid: str
     caller_phone: str
@@ -228,7 +239,8 @@ def format_owner_alert(t: dict[str, Any]) -> str:
 
 
 def _lookup_customer(ctx: ToolContext, args: _LookupInput) -> dict[str, Any]:
-    matches = ctx.db.find_customers(phone=normalize_phone(ctx.caller_phone), address=args.address)
+    b = ctx.business.twilio_number
+    matches = ctx.db.find_customers(b, phone=normalize_phone(ctx.caller_phone), address=args.address)
     if not matches:
         return {"found": False, "message": "No record for this number or address. Treat as a new caller or ask them to spell the address."}
     c = matches[0]
@@ -239,7 +251,7 @@ def _lookup_customer(ctx: ToolContext, args: _LookupInput) -> dict[str, Any]:
         "customer_id": c["id"],
         "property_type": c["property_type"],
         "plan": c["plan"],
-        "open_tickets": len(ctx.db.open_tickets(customer_id=c["id"], caller_phone=ctx.caller_phone)),
+        "open_tickets": len(ctx.db.open_tickets(b, customer_id=c["id"], caller_phone=ctx.caller_phone)),
     }
     if caller_verified:
         # Only reveal account details to the phone number on the account.
@@ -249,30 +261,53 @@ def _lookup_customer(ctx: ToolContext, args: _LookupInput) -> dict[str, Any]:
     return record
 
 
+def _area(ctx: ToolContext, town: str | None, zip_code: str | None) -> dict[str, Any]:
+    b = ctx.business
+    if not b.has_structured_area:
+        return {
+            "in_service_area": None,
+            "service_area": b.service_area,
+            "message": "No town list on file. Decide from the service area description; "
+            "if you can't tell, capture the lead and let the owner confirm.",
+        }
+    return check_service_area(town, zip_code, b.service_towns, b.service_zip_prefixes)
+
+
 def _check_service_area(ctx: ToolContext, args: _AreaInput) -> dict[str, Any]:
     if not args.town and not args.zip_code:
         raise ToolError("Provide a town or a ZIP code.")
-    return check_service_area(args.town, args.zip_code, ctx.settings.service_towns, ctx.settings.service_zip_prefixes)
+    return _area(ctx, args.town, args.zip_code)
+
+
+def _send_booking_link(ctx: ToolContext, _: _Empty) -> dict[str, Any]:
+    link = ctx.business.booking_link
+    if not link:
+        raise ToolError("This business has no booking link. Capture the lead instead.")
+    sent = ctx.notifier.text(ctx.caller_phone, f"{ctx.business.name}: book your snow service here: {link}")
+    if not sent:
+        raise ToolError("Couldn't text this caller (no textable caller ID). Capture the lead instead.")
+    return {"sent": True, "message": "Tell the caller the link is on its way by text."}
 
 
 def _create_ticket(ctx: ToolContext, args: _TicketInput) -> dict[str, Any]:
     missing = [f for f in _REQUIRED_BY_CALL_TYPE[args.call_type] if not getattr(args, f)]
     if missing:
         raise ToolError(f"Missing {', '.join(missing)}. Ask the caller for it before logging this call.")
-    if args.call_type == "new_lead":
+    if args.call_type == "new_lead" and ctx.business.has_structured_area:
         if not args.town and not args.zip_code:
             raise ToolError("Missing town or ZIP code. Ask for it so the service area can be checked.")
-        area = check_service_area(args.town, args.zip_code, ctx.settings.service_towns, ctx.settings.service_zip_prefixes)
-        if not area["in_service_area"]:
+        if _area(ctx, args.town, args.zip_code)["in_service_area"] is False:
             raise ToolError("Outside the service area. Do not log a lead; tell the caller we don't cover that area.")
 
     callback = normalize_phone(args.callback_number) or args.callback_number or ctx.caller_phone
     customer_id = None
     if args.call_type in ("existing_customer", "complaint", "emergency"):
-        matches = ctx.db.find_customers(phone=normalize_phone(ctx.caller_phone), address=args.address)
+        matches = ctx.db.find_customers(ctx.business.twilio_number, phone=normalize_phone(ctx.caller_phone),
+                                        address=args.address)
         customer_id = matches[0]["id"] if matches else None
 
     ticket = ctx.db.create_ticket(
+        ctx.business.twilio_number,
         call_sid=ctx.call_sid,
         call_type=args.call_type,
         priority="priority_one" if args.call_type == "emergency" else args.priority,
@@ -291,26 +326,26 @@ def _create_ticket(ctx: ToolContext, args: _TicketInput) -> dict[str, Any]:
         details=args.details,
     )
 
-    s = ctx.settings
+    b = ctx.business
     owner_alerted = ctx.notifier.alert_owner(format_owner_alert(ticket))
     confirm_to = callback if normalize_phone(callback) else ctx.caller_phone
     caller_texted = ctx.notifier.text(
         confirm_to,
-        f"Thanks for calling {s.company_name}. We've got your request (#{ticket['id']}) and the "
-        f"owner will call you back within {s.callback_timeframe}.",
+        f"Thanks for calling {b.name}. We've got your request (#{ticket['id']}) and the "
+        f"owner will call you back within {b.callback_timeframe}.",
     )
     return {
         "ticket_id": ticket["id"],
         "priority": ticket["priority"],
         "owner_alerted": owner_alerted,
         "caller_sms_sent": caller_texted,
-        "callback_timeframe": s.callback_timeframe,
+        "callback_timeframe": b.callback_timeframe,
     }
 
 
 def _transfer_call(ctx: ToolContext, args: _TransferInput) -> dict[str, Any]:
-    s = ctx.settings
-    target = s.emergency_phone if args.reason == "safety_hazard" else s.owner_phone
+    b = ctx.business
+    target = b.emergency_phone if args.reason == "safety_hazard" else b.alert_phone
     ctx.notifier.alert_owner(
         f"{'PRIORITY ONE ' if args.reason == 'safety_hazard' else ''}TRANSFER ({_label(args.reason)}) "
         f"from {ctx.caller_phone}: {args.details}"
@@ -319,7 +354,7 @@ def _transfer_call(ctx: ToolContext, args: _TransferInput) -> dict[str, Any]:
         return {
             "transferred": False,
             "message": f"Nobody can take a live transfer right now. The owner has been texted. Tell the "
-            f"caller the owner will call them back within {s.callback_timeframe}, then end the call.",
+            f"caller the owner will call them back within {b.callback_timeframe}, then end the call.",
         }
     ctx.control.transfer_to = target
     ctx.control.transfer_reason = args.reason
@@ -336,6 +371,7 @@ def _end_call(ctx: ToolContext, args: _EndInput) -> dict[str, Any]:
 _HANDLERS = {
     "lookup_customer": _lookup_customer,
     "check_service_area": _check_service_area,
+    "send_booking_link": _send_booking_link,
     "create_ticket": _create_ticket,
     "transfer_call": _transfer_call,
     "end_call": _end_call,

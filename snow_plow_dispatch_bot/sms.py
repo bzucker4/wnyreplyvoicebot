@@ -25,14 +25,14 @@ def normalize_phone(raw: str | None) -> str | None:
 
 
 class SmsSender(Protocol):
-    def send(self, to: str, body: str) -> bool: ...
+    def send(self, to: str, body: str, from_: str) -> bool: ...
 
 
 class NullSmsSender:
     """Used when Twilio REST credentials are not configured (local dev, tests)."""
 
-    def send(self, to: str, body: str) -> bool:
-        log.info("SMS disabled; would send to %s: %s", to, body)
+    def send(self, to: str, body: str, from_: str) -> bool:
+        log.info("SMS disabled; would send from %s to %s: %s", from_, to, body)
         return False
 
 
@@ -41,11 +41,10 @@ class TwilioSmsSender:
         from twilio.rest import Client
 
         self._client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
-        self._from = settings.twilio_from_number
 
-    def send(self, to: str, body: str) -> bool:
+    def send(self, to: str, body: str, from_: str) -> bool:
         try:
-            self._client.messages.create(to=to, from_=self._from, body=body)
+            self._client.messages.create(to=to, from_=from_, body=body)
             return True
         except Exception:  # SMS is best-effort; never fail the call over it
             log.exception("failed to send SMS to %s", to)
@@ -53,20 +52,21 @@ class TwilioSmsSender:
 
 
 class Notifier:
-    """Sends texts only to numbers that look real (skips blocked/anonymous caller IDs)."""
+    """Texts from one business's Twilio number; skips blocked/anonymous caller IDs."""
 
-    def __init__(self, settings: Settings, sender: SmsSender) -> None:
-        self.settings = settings
+    def __init__(self, sender: SmsSender, from_number: str, alert_phone: str | None) -> None:
         self.sender = sender
+        self.from_number = from_number
+        self.alert_phone = alert_phone
 
     def text(self, to: str | None, body: str) -> bool:
         number = normalize_phone(to)
         if not number:
             return False
-        return self.sender.send(number, body)
+        return self.sender.send(number, body, self.from_number)
 
     def alert_owner(self, body: str) -> bool:
-        return self.text(self.settings.owner_phone, body)
+        return self.text(self.alert_phone, body)
 
 
 def build_sms_sender(settings: Settings) -> SmsSender:
